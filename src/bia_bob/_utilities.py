@@ -1,18 +1,40 @@
-def generate_response_to_user(model, user_prompt: str, image=None, additional_system_prompt: str = None, max_number_attempts:int = 3):
+import warnings
+from functools import lru_cache
+
+def ask_llm(prompt, image=None, chat_history=None):
+    """Ask the language model a simple question and return the response."""
+    from ._machinery import Context, init_assistant
+    if Context.model is None:
+        init_assistant()
+
+    if chat_history is None:
+        chat_history = []
+
+    return generate_response(chat_history=chat_history,
+                      image=image,
+                      model=Context.model,
+                      system_prompt="",
+                      user_prompt=prompt,
+                      vision_system_prompt="")
+
+
+def generate_response_to_user(model, user_prompt: str, image=None, additional_system_prompt: str = None, max_number_attempts:int = 3, system_prompt:str=None):
     """Generates code and text respond for a specific user input.
     To do so, it combines the user input with additional context such as
     current variables and a prompt template."""
-    from ._machinery import Context, BLABLADOR_BASE_URL
-    import os
+    from ._machinery import Context
 
     text, plan, code = None, None, None
 
     chat_backup = [c for c in Context.chat]
 
     for attempt in range(1, max_number_attempts + 1):
-        system_prompt = create_system_prompt()
+        if system_prompt is None:
+            system_prompt = create_system_prompt()
         if additional_system_prompt is not None:
             system_prompt += "\n" + additional_system_prompt
+
+        vision_system_prompt = create_vision_system_prompt()
 
         # take the last n chat entries
         n = 10
@@ -23,32 +45,29 @@ def generate_response_to_user(model, user_prompt: str, image=None, additional_sy
             print("\nSystem prompt:", system_prompt)
             print_chat(chat_history)
 
-        if Context.endpoint is not None:
-            full_response = generate_response_from_openai(model, system_prompt, user_prompt, chat_history, image,
-                                                          base_url=Context.endpoint, api_key=Context.api_key)
-        elif "gpt-" in model:
-            full_response = generate_response_from_openai(model, system_prompt, user_prompt, chat_history, image)
-        elif "gemini-" in model:
-            full_response = generate_response_from_vertex_ai(model, system_prompt, user_prompt, chat_history, image)
-        else:
-            raise RuntimeError(f"Unknown model API for {model}")
+        full_response = generate_response(chat_history, image, model, system_prompt, user_prompt, vision_system_prompt)
+        Context.chat = chat_history
 
         if Context.verbose:
             print("\n\nFull response:\n", full_response)
 
-        full_response = full_response\
-                        .replace("```python", "```")\
-                        .replace("```nextflow", "```")\
-                        .replace("```java", "```")\
-                        .replace("```javascript", "```")\
-                        .replace("```macro", "```")\
-                        .replace("```groovy", "```")\
-                        .replace("```jython", "```")
+
 
         # split response in text and code
         text, plan, code = split_response(full_response)
 
+        if text is not None and plan is not None and code is None:
+            text = text + "\n\n" + plan
+            break
+
+        if text is None and code is None:
+            text = full_response
+            break
+
         if text is not None and plan is not None:
+            break
+
+        if image is not None:
             break
 
         print(f"There was an issue. Retrying ({attempt}/{max_number_attempts})...")
@@ -56,7 +75,74 @@ def generate_response_to_user(model, user_prompt: str, image=None, additional_sy
 
     return code, text
 
+
+def generate_response(chat_history, image, model, system_prompt, user_prompt, vision_system_prompt):
+    from ._machinery import Context
+    from .endpoints._openai import generate_response_from_openai
+    from .endpoints._googlevertex import generate_response_from_vertex_ai, generate_response_from_google_ai
+    from .endpoints._anthropic import generate_response_from_anthropic
+    from .endpoints._azure import generate_response_from_azure
+    from .endpoints._mistral import generate_response_from_mistral
+
+    if (Context.endpoint == "github_models" or Context.endpoint == "azure") and "gpt-" not in model and "o1-" not in model and "mistral" not in model:
+        full_response = generate_response_from_azure(model, system_prompt, user_prompt, chat_history, image,
+                                                      base_url=Context.endpoint, api_key=Context.api_key,
+                                                      vision_model=Context.vision_model,
+                                                      vision_system_prompt=vision_system_prompt)
+    elif "mistral" in model:
+        full_response = generate_response_from_mistral(model, system_prompt, user_prompt, chat_history, image,
+                                                      base_url=Context.endpoint, api_key=Context.api_key,
+                                                      vision_model=Context.vision_model,
+                                                      vision_system_prompt=vision_system_prompt)
+
+    elif Context.endpoint is not None:
+        full_response = generate_response_from_openai(model, system_prompt, user_prompt, chat_history, image,
+                                                      base_url=Context.endpoint, api_key=Context.api_key,
+                                                      vision_model=Context.vision_model,
+                                                      vision_system_prompt=vision_system_prompt)
+    elif "gpt-" in model:
+        full_response = generate_response_from_openai(model, system_prompt, user_prompt, chat_history, image,
+                                                      vision_model=Context.vision_model,
+                                                      vision_system_prompt=vision_system_prompt)
+    elif model == "gemini" or model == "gemini-pro" or model == "gemini-pro-vision":
+        import warnings
+        warnings.warn(f"The model {model} is deprecated. Consider using gemini-1.5-flash or gemini-1.5-pro instead.")
+        full_response = generate_response_from_vertex_ai(model, system_prompt, user_prompt, chat_history, image,
+                                                         vision_model=Context.vision_model,
+                                                         vision_system_prompt=vision_system_prompt)
+    elif "gemini" in model:
+        full_response = generate_response_from_google_ai(model, system_prompt, user_prompt, chat_history, image,
+                                                         vision_model=Context.vision_model,
+                                                         vision_system_prompt=vision_system_prompt)
+    elif model.startswith("claude"):
+        full_response = generate_response_from_anthropic(model, system_prompt, user_prompt, chat_history, image,
+                                                      vision_model=Context.vision_model,
+                                                      vision_system_prompt=vision_system_prompt)
+    else:
+        raise RuntimeError(f"Unknown model API for {model}")
+    return full_response
+
+
 def split_response(text):
+    backup_text = text
+    text = text \
+        .replace("```python", "```") \
+        .replace("```Python", "```") \
+        .replace("```nextflow", "```") \
+        .replace("```java", "```") \
+        .replace("```javascript", "```") \
+        .replace("```macro", "```") \
+        .replace("```groovy", "```") \
+        .replace("```jython", "```") \
+        .replace("```md", "```") \
+        .replace("```markdown", "```") \
+        .replace("```txt", "```") \
+        .replace("```csv", "```") \
+        .replace("```yml", "```") \
+        .replace("```yaml", "```") \
+        .replace("```json", "```") \
+        .replace("```py", "```")
+
     # hotfix modifications for not-so-capable models (e.g. ollama/codellama or blablador/Mistral-7B-Instruct-v0.2)
     for item in ["Summary", "Plan", "Code"]:
         text = "\n" + text
@@ -79,7 +165,17 @@ def split_response(text):
         elif sections[i] == 'Code':
             code = sections[i + 1]
 
+    if summary is None and plan is None and code is None and "```python" in backup_text:
+        # second attempt
+        pattern = r"```python\n(.*?)\n```"
+        code_blocks = re.findall(pattern, backup_text, re.DOTALL)
+        code = "\n".join(code_blocks)
+        summary = backup_text.split("```python")[0]
+        plan = ""
+        return summary, plan, code
+
     if code is not None:
+        original_code = code
         parts = code.split("```")
         if len(parts) == 1:
             code = None
@@ -90,51 +186,37 @@ def split_response(text):
                 code = code + c
             code = code.strip("\n")
 
+        if code is None or len(code) == 0:
+            code = original_code
+
     return summary, plan, code
 
 
-def create_system_prompt(reusable_variables_block=None):
-    """Creates a system prompt that contains instructions of general interest, available functions and variables."""
-    # determine useful variables and functions in context
-
-    # if scikit-image is installed, give hints how to use it
+@lru_cache(maxsize=1)
+def generate_code_samples():
+    """Load code snippets from built-in suggestions and plugins."""
     from ._machinery import Context
+    import importlib
+    import os
 
-    skimage_snippets = """
-    * Load an image file from disc and store it in a variable:
-    ```
-    from skimage.io import imread
-    image = imread(filename)
-    ```
-    * Expanding labels by a given radius in a label image works like this:
-    ```
-    from skimage.segmentation import expand_labels
-    expanded_labels = expand_labels(label_image, distance=10)
-    ```
-    * Measure properties of labels with respect to an image works like this:
-    ```
-    from skimage.measure import regionprops
-    properties = regionprops(label_image, image)
-    ```
-    """
-    if "scikit-image" not in Context.libraries:
-        skimage_snippets = ""
+    snippets = []
 
-    # if aicsimageio is installed, give hints how to use it
-    aicsimageio_snippets = """
-    * Loading files with endings other than `.tif`, `.png` or `.jpg` works like this:
-    ```
-    from aicsimageio import AICSImage
-    aics_image = AICSImage(image_filename)
-    image = aics_image.get_image_data("ZYX")
-    ```
-    """
-    if "aicsimageio" not in Context.libraries:
-        aicsimageio_snippets = ""
+    # load built-in suggestions:
+    for filename in os.listdir(os.path.join(os.path.dirname(__file__), "suggestions")):
+        if filename.startswith("_") and filename.endswith(".py"):
+            module = filename[1:-3]
+            original_module_name = module
+            if module in Context.libraries or module.replace("_", "-") in Context.libraries:
+                pass
+            else:
+                continue
 
-    if reusable_variables_block is None:
-        reusable_variables_block = create_reusable_variables_block()
+            loaded_module = importlib.import_module(f"bia_bob.suggestions._{original_module_name}")
+            func = getattr(loaded_module, f"suggestions")
+            snippets.append(func())
+    snippets = "\n".join(snippets)
 
+    # load plugin suggestions
     if Context.plugins_enabled:
         from importlib.metadata import entry_points
 
@@ -151,10 +233,18 @@ def create_system_prompt(reusable_variables_block=None):
         additional_instructions = []
         # Iterate over discovered entry points and load them
         for ep in bia_bob_plugins:
-            func = ep.load()
+            instructions = ""
+            
+            try:
+                func = ep.load()
 
-            # load instructions from a plugin
-            instructions = func()
+                # load instructions from a plugin
+                instructions = func()
+            except:
+                # do not crash if plugins are crashing
+                print("error")
+                pass
+
             # special treatment for code snippets from stackview, as it won't work with the custom kernel
             if "stackview" not in instructions or "stackview" in Context.libraries:
                 additional_instructions.append(instructions)
@@ -163,20 +253,50 @@ def create_system_prompt(reusable_variables_block=None):
     else:
         additional_snippets = ""
 
+    additional_snippets = shorten_text(additional_snippets)
+
+    return shorten_text(snippets), shorten_text(additional_snippets)
+
+
+def shorten_text(text):
+    while (" \n" in text):
+        text = text.replace(" \n", "\n")
+
+    while ("\n\n\n" in text):
+        text = text.replace("\n\n\n", "\n\n")
+
+    return text
+
+def create_system_prompt(reusable_variables_block=None):
+    """Creates a system prompt that contains instructions of general interest, available functions and variables."""
+    from ._machinery import Context
+
+    # determine useful variables and functions in context
+    if reusable_variables_block is None:
+        reusable_variables_block = create_reusable_variables_block()
+    else:
+        warnings.warn("Deprecated use of create_system_prompt with reusable_variables_block. Do not pass this parameter to make your code work mid/long-term.")
+
+    snippets, additional_snippets = generate_code_samples()
+    libraries = Context.libraries
+
     system_prompt = f"""
     You are a extremely talented bioimage analyst and you use Python to solve your tasks unless stated otherwise.
-    If the request entails writing code, write concise professional bioimage analysis high-quality code.
     If there are several ways to solve the task, chose the option with the least amount of code.    
-    If there is no specific programming language required, write python code and follow the below instructions.
     
+    ## Python specific instructions
+    
+    When writing python code, you can only use those libraries: {",".join([str(v) for v in libraries])}.
+    If you create images, show the results and save them in variables for later reuse.
     {reusable_variables_block}
+    NEVER overwrite the values of the variables and functions that are available.
     
     ## Python specific code snippets
     
     If the user asks for those simple tasks, use these code snippets.
-    {skimage_snippets}
-    {aicsimageio_snippets}
+    
     {additional_snippets}
+    {snippets}
     
     ## Todos
     
@@ -210,35 +330,47 @@ def create_system_prompt(reusable_variables_block=None):
     return system_prompt
 
 
+def create_vision_system_prompt():
+    vision_system_prompt = """
+    Describe the given image. Assume it is a scientific image resulting from imaging devices such as microscope, clinical scanners or other kinds of detectors.
+    Consider describing the image's background (bright, dark, homogeneous, inhomogeneous) and forgreound (blobs, meshes, membranes, cells, subcellular structures, crystals, etc.)
+    Describe the image's quality (resolution, noise, artifacts, etc.)
+    Describe the image's content (how many objects, large, small objects, etc.)
+    """
+    return vision_system_prompt
+
+
 def create_reusable_variables_block():
     """Creates a block of text that explains which variables, functions and libraries are
     available to be used."""
     variables = []
     functions = []
+    modules = []
     from ._machinery import Context
+    import types
 
     # figure out which variables are not private
     for key, value in Context.variables.items():
         if key.startswith("_"):
             continue
         if callable(value):
-            if key not in ["quit", "exit"]:
+            if key not in ["quit", "exit", "get_ipython", "open", "bob"]:
                 functions.append(key)
+            continue
+        if isinstance(value, types.ModuleType):
+            if key != "bia_bob":
+                modules.append(key)
+            continue
+        if key in ["In", "Out"]:
             continue
         variables.append(key)
 
-    libraries = Context.libraries
-
     return f"""
-    ## Python specific instructions
-    
-    For python, you can only use those libraries: {",".join([str(v) for v in libraries])}.
-    If you create images, show the results and save them in variables for later reuse.
-    The following variables are available: {",".join([str(v) for v in variables])}
-    NEVER the values of the variables that are available.
-    
-    The following functions are available: {",".join([str(v) for v in functions])}
+    The following variables are defined: {",".join([str(v) for v in variables])}    
+    The following functions are defined: {",".join([str(v) for v in functions])}    
+    The following modules or aliases are imported: {",".join([str(v) for v in modules])}
     """
+
 
 def print_chat(chat):
     print("\nChat history:")
@@ -275,155 +407,34 @@ def is_notebook() -> bool:
         return False      # Probably standard Python interpreter
 
 
-def generate_response_from_openai(model: str, system_prompt: str, user_prompt: str, chat_history, image=None,
-                                  base_url:str=None, api_key:str=None):
-    """A prompt helper function that sends a message to openAI
-    and returns only the text response.
-    """
-    from openai import OpenAI
-    from ._machinery import Context
+def numpy_to_bytestream(data):
+    """Turn a NumPy array into a bytestream"""
+    import numpy as np
+    from PIL import Image
+    import io
 
-    # assemble prompt
-    system_message = [{"role": "system", "content": system_prompt}]
-    user_message = [{"role": "user", "content": user_prompt}]
-    image_message = []
-    kwargs = {}
+    # Convert the NumPy array to a PIL Image
+    image = Image.fromarray(data.astype(np.uint8)).convert("RGBA")
 
-    if image is not None:
-        image_message = image_to_message(image)
+    # Create a BytesIO object
+    bytes_io = io.BytesIO()
 
-    if model == "gpt-4-vision-preview":
-        # this seems necessary according to the docs:
-        # https://platform.openai.com/docs/guides/vision
-        # if it is not provided, the response will be
-        # cropped to half a sentence
-        kwargs['max_tokens'] = 3000
+    # Save the PIL image to the BytesIO object as a PNG
+    image.save(bytes_io, format='PNG')
 
-    if Context.seed is not None:
-        kwargs['seed'] = Context.seed
-    if Context.temperature is not None:
-        kwargs['temperature'] = Context.temperature
-
-    # init client
-    if Context.client is None or not isinstance(Context.client, OpenAI):
-        Context.client = OpenAI()
-
-    if api_key is not None:
-        Context.client.api_key = api_key
-    if base_url is not None:
-        Context.client.base_url = base_url
-
-    # retrieve answer
-    response = Context.client.chat.completions.create(
-        messages=system_message + chat_history + image_message + user_message,
-        model=model,
-        **kwargs
-    )  # stream=True would be nice
-    reply = response.choices[0].message.content
-
-    # store question and answer in chat history
-    assistant_message = [{"role": "assistant", "content": reply}]
-    Context.chat += user_message + assistant_message
-
-    return reply
+    # return the beginning of the file as a bytestream
+    bytes_io.seek(0)
+    return bytes_io.read()
 
 
-def generate_response_from_vertex_ai(model: str, system_prompt: str, user_prompt: str, chat_history, image=None):
-    """A prompt helper function that sends a message to Google Vertex AI
-    and returns only the text response.
-
-    See also
-    --------
-    https://colab.research.google.com/github/GoogleCloudPlatform/generative-ai/blob/main/gemini/getting-started/intro_gemini_python.ipynb#scrollTo=SFbGVflTfBBk
-    """
-    # from vertexai.generative_models._generative_models import ChatSession
-    from ._machinery import Context
-    from vertexai.preview.generative_models import (
-        GenerationConfig,
-        GenerativeModel,
-        Image,
-        Part,
-        ChatSession,
-    )
-
-
-    if "vision" in Context.model:
-        # We need to do some special case here, because the vision model seems to not support chats (yet).
-        if Context.client is None or not isinstance(Context.client, GenerativeModel):
-            Context.client = GenerativeModel(Context.model)
-
-        if image is None:
-            prompt = f"""
-                       {system_prompt}
-                       
-                       # Task
-                       This is the task:
-                       {user_prompt}
-                       
-                       Remember: Your output should be 1) a summary, 2) a plan and 3) the code.
-                       """
-        if image is not None:
-            from stackview._image_widget import _img_to_rgb
-            from darth_d._utilities import numpy_to_bytestream
-
-            rgb_image = _img_to_rgb(image)
-            byte_stream = numpy_to_bytestream(rgb_image)
-
-            image = Image.from_bytes(byte_stream)
-
-            prompt = f"""
-                   {system_prompt}
-
-                   # Task
-                   This is the task:
-                   {user_prompt}
-
-                   If the task is not explicitly about generating code, do not generate any code.
-                   """
-
-            prompt = [image, prompt]
-
-        response = Context.client.generate_content(prompt).text
-
-    else:
-
-        system_prompt = create_system_prompt(reusable_variables_block="")
-
-        if Context.client is None or not isinstance(Context.client, ChatSession):
-            model = GenerativeModel(Context.model)
-            Context.client = model.start_chat()
-            system_result = Context.client.send_message(system_prompt + "\n\nConfirm these general instructioons by answering 'yes'.").text
-
-        reusable_variables_block = create_reusable_variables_block()
-
-        prompt = f"""{reusable_variables_block}
-        
-        # Task
-        This is the task:
-        {user_prompt}
-        
-        Remember: Your output should be 1) a step-by-step plan and 2) code.
-        """
-
-        response = Context.client.send_message(prompt).text
-
-    return response
-
-
-def image_to_message(image):
+def image_to_url(image):
     import base64
-
     from stackview._image_widget import _img_to_rgb
-    from darth_d._utilities import numpy_to_bytestream
 
     rgb_image = _img_to_rgb(image)
     byte_stream = numpy_to_bytestream(rgb_image)
     base64_image = base64.b64encode(byte_stream).decode('utf-8')
-
-    return [{"role": "user", "content": [{
-        "type": "image_url",
-        "image_url": f"data:image/jpeg;base64,{base64_image}",
-    }]}]
+    return f"data:image/png;base64,{base64_image}"
 
 
 def is_image(potential_image):
@@ -433,13 +444,23 @@ def is_image(potential_image):
 
 def correct_endpoint(endpoint, api_key):
     import os
-    from ._machinery import BLABLADOR_BASE_URL, OLLAMA_BASE_URL
+    from ._machinery import BLABLADOR_BASE_URL, OLLAMA_BASE_URL, AZURE_BASE_URL
     if endpoint == 'blablador':
         endpoint = BLABLADOR_BASE_URL
         if api_key is None:
             api_key = os.environ.get('BLABLADOR_API_KEY')
     elif endpoint == 'ollama':
         endpoint = OLLAMA_BASE_URL
+    elif endpoint == "azure":
+        endpoint = AZURE_BASE_URL
+        if api_key is None:
+            api_key = os.environ.get('AZURE_API_KEY')
+
+    elif endpoint == "github_models":
+        endpoint = AZURE_BASE_URL
+        if api_key is None:
+            api_key = os.environ.get('GH_MODELS_API_KEY')
+
     return endpoint, api_key
 
 
@@ -494,3 +515,61 @@ def keep_available_packages(libraries):
 
     return result
 
+
+def version_string(model, vision_model, endpoint, version):
+    return f"""Used model: {model}, vision model: {vision_model}, endpoint: {endpoint}, bia-bob version: {version}."""
+
+
+def remove_outer_markdown_annotation(code):
+    """In case code is wrapped in markdown annotations / code quotations, remove them. Returns the code only"""
+    for subheader in ["Code", "Plan", "Summary"]:
+        if "#" + subheader not in code:
+            code = code + f"\n\n### {subheader}\n" + code
+
+    _, _, new_code = split_response(code)
+
+    return new_code
+
+
+def refine_code(code):
+    """Uses reflection to figure out which variables are available and imports are missing.
+    The LLM is asked to refine the code accordingly."""
+    if "%bob" in code:
+        # task was to write a prompt
+        return code
+    original_code = code
+
+    try:
+        import pyclesperanto
+        prototype = ""
+    except:
+        prototype = "_prototype"
+
+    reusable_variables_block = create_reusable_variables_block()
+    refined_code = ask_llm(f"""
+    
+    Given a list of available variables, functions and modules:
+    {reusable_variables_block}
+    
+    Modify the following code:
+    ```python
+    {code}
+    ```
+    
+    Make sure the following conditions are met:
+    * The code imports all functions and modules, that are not mentioned above.
+    * Modules which are available already, are not imported.
+    * Do not overwrite variables, if the arey in the list of defined variables.
+    * Take care that only common python libraries are imported. Do not make up modules.
+    * Avoid `import cle`. If you see something like this, `import pyclesperanto{prototype} as cle` instead.
+    * Avoid `from stackview import stackview`. If you see something like this, `import stackview` instead.
+    * Do not import modules or aliases which were already imported before.
+    * Do NOT replace values such as filenames with variables.
+    
+    Return the code only.
+    """)
+
+    result = remove_outer_markdown_annotation(refined_code)
+    if result is None:
+        return original_code
+    return result
