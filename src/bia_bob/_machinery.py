@@ -6,6 +6,55 @@ DEFAULT_VISION_MODEL = 'gpt-4o-2024-08-06'
 BLABLADOR_BASE_URL = 'https://helmholtz-blablador.fz-juelich.de:8000/v1'
 OLLAMA_BASE_URL = 'http://localhost:11434/v1'
 AZURE_BASE_URL = "https://models.inference.ai.azure.com"
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+
+DEFAULT_SYSTEM_PROMPT = """
+You are a extremely talented bioimage analyst and you use Python to solve your tasks unless stated otherwise.
+If there are several ways to solve the task, chose the option with the least amount of code.    
+
+## Python specific instructions
+
+When writing python code, you can only use those libraries: {libraries}.
+If you create images, show the results and save them in variables for later reuse.
+{reusable_variables}
+NEVER overwrite the values of the variables and functions that are available.
+
+## Python specific code snippets
+
+If the user asks for those simple tasks, use these code snippets.
+
+{additional_snippets}
+{builtin_snippets}
+
+## Todos
+
+Answer your response in three sections:
+1. Summary: First provide a short summary of the task.
+2. Plan: Provide a concise step-by-step plan without any code.
+3. Code: Provide the code.
+
+Structure it with markdown headings like this:
+
+### Summary
+I will do this and that.
+
+### Plan
+1. Do this.
+2. Do that.
+
+### Code
+```
+this()
+that()
+```
+
+## Final remarks
+
+The following points have highest importance and may overwrite the instructions above.
+Make sure to provide 1) summary, 2) plan and 3) code.
+Make sure to keep your answer concise and to the point. Make sure the code you write is correct and can be executed.
+"""
 
 
 class Context:
@@ -21,6 +70,7 @@ class Context:
     temperature = None # openai only
     endpoint = None
     api_key = None
+    system_prompt_template = DEFAULT_SYSTEM_PROMPT
 
     libraries = keep_available_packages([
         "scikit-image",
@@ -95,16 +145,19 @@ def bob(line: str = None, cell: str = None):
 
     TASK_TYPE_OTHER = 1
     TASK_TYPE_CODE_GENERATION = 1
-    TASK_TYPE_TEXT_RESPONSE = 2
-    TASK_TYPE_NOTEBOOK_GENERATION = 3
-    TASK_TYPE_NOTEBOOK_MODIFICATION = 4
-    TASK_TYPE_FILE_GENERATION = 5
+    TASK_TYPE_CODE_MODIFICATION = 2
+    TASK_TYPE_TEXT_RESPONSE = 3
+    TASK_TYPE_NOTEBOOK_GENERATION = 4
+    TASK_TYPE_NOTEBOOK_MODIFICATION = 5
+    TASK_TYPE_FILE_GENERATION = 6
+
 
     supported_file_types_for_generation = [".md", ".txt", ".csv", ".yml", ".yaml", ".json", ".py"]
 
     task_selection_prompt = f"""
     Given the following prompt, decide which of the following types of tasks we need to perform:
     {TASK_TYPE_CODE_GENERATION}. Code generation: The prompt asks for code to be generated.
+    {TASK_TYPE_CODE_MODIFICATION}. Code modification: The prompt asks for given code to be modified.
     {TASK_TYPE_TEXT_RESPONSE}. Text response: The prompt asks for a text response.    
     {TASK_TYPE_NOTEBOOK_GENERATION}. Notebook generation: The prompt asks explicitly for a notebook to be generated. Only choose this if the prompt explicitly asks for creating a new notebook.
     {TASK_TYPE_NOTEBOOK_MODIFICATION}. Notebook modification: The prompt asks for a modification of an existing notebook. Only choose this if the prompt explicitly asks for modifying an existing notebook and a) a notebook filename is given or b) the current notebook is mentioned.
@@ -160,7 +213,9 @@ def bob(line: str = None, cell: str = None):
             text = f"The file has been saved as [{filename}]({filename})."
         else:
             text = f"The file has been saved as {filename}. You can open it using:\n\n    jupyter lab {filename}\n\n"
-    else:
+    else: # TASK_TYPE_CODE_MODIFICATION or TASK_TYPE_CODE_GENERATION
+        if task_type == TASK_TYPE_CODE_MODIFICATION:
+            user_input = user_input + "\n\nReturn the complete code. Keep the code modifications minimal. Do not drop imports or functions which are still needed."
         code, text = generate_response_to_user(Context.model, user_input, image)
 
         if image is not None:
@@ -175,9 +230,9 @@ def bob(line: str = None, cell: str = None):
             })
 
     # print out explanation
-    if code is None:
-        output_text(text)
-    else:
+    output_text(text)
+
+    if code is not None and task_type != TASK_TYPE_CODE_MODIFICATION:
         code = refine_code(code)
 
     if code is not None:
@@ -185,7 +240,7 @@ def bob(line: str = None, cell: str = None):
 
         # put a new cell below the current cell
         if p is not None:
-            p.set_next_input(code, replace=False)
+            p.set_next_input(code, replace=task_type == TASK_TYPE_CODE_MODIFICATION)
         else:
             print(code)
 
@@ -209,7 +264,7 @@ def combine_user_input(line, cell):
 
 
 def init_assistant(model=None, auto_execute:bool = False, variables:dict=None, endpoint=None, api_key=None,
-                   vision_model=None, keep_history:bool=False, silent:bool=False):
+                   vision_model=None, keep_history:bool=False, silent:bool=False, system_prompt=None):
     """Initialises the assistant.
 
     Parameters
@@ -235,6 +290,7 @@ def init_assistant(model=None, auto_execute:bool = False, variables:dict=None, e
         "model": DEFAULT_MODEL,
         "vision_model": DEFAULT_VISION_MODEL,
         "endpoint": None,
+        "system_prompt": DEFAULT_SYSTEM_PROMPT
     }
 
     # load config from disk
@@ -250,11 +306,17 @@ def init_assistant(model=None, auto_execute:bool = False, variables:dict=None, e
         model = config["model"]
         vision_model = config["vision_model"]
         endpoint = config["endpoint"]
+    if system_prompt is None:
+        if "system_prompt" in config.keys():
+            system_prompt = config["system_prompt"]
+        else:
+            system_prompt = DEFAULT_SYSTEM_PROMPT
 
     # store config to disk
     config["model"] = model
     config["vision_model"] = vision_model
     config["endpoint"] = endpoint
+    config["system_prompt"] = system_prompt
     with open(config_filename, 'w') as file:
         yaml.dump(config, file, default_flow_style=False)
 
@@ -279,6 +341,7 @@ def init_assistant(model=None, auto_execute:bool = False, variables:dict=None, e
 
     Context.endpoint = endpoint
     Context.api_key = api_key
+    Context.system_prompt_template = system_prompt
 
     if Context.verbose:
         print("Assistant initialised. You can now use it, e.g., copy and paste the"

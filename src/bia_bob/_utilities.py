@@ -83,13 +83,19 @@ def generate_response(chat_history, image, model, system_prompt, user_prompt, vi
     from .endpoints._anthropic import generate_response_from_anthropic
     from .endpoints._azure import generate_response_from_azure
     from .endpoints._mistral import generate_response_from_mistral
+    from ._machinery import OPENROUTER_BASE_URL
 
-    if (Context.endpoint == "github_models" or Context.endpoint == "azure") and "gpt-" not in model and "o1-" not in model and "mistral" not in model:
+    if Context.endpoint == "openrouter" or Context.endpoint == OPENROUTER_BASE_URL:
+        full_response = generate_response_from_openai(model, system_prompt, user_prompt, chat_history, image,
+                                                     base_url=Context.endpoint, api_key=Context.api_key,
+                                                     vision_model=Context.vision_model,
+                                                     vision_system_prompt=vision_system_prompt)
+    elif (Context.endpoint == "github_models" or Context.endpoint == "azure") and "gpt-" not in model and "o1-" not in model and "mistral" not in model:
         full_response = generate_response_from_azure(model, system_prompt, user_prompt, chat_history, image,
                                                       base_url=Context.endpoint, api_key=Context.api_key,
                                                       vision_model=Context.vision_model,
                                                       vision_system_prompt=vision_system_prompt)
-    elif "mistral" in model:
+    elif "mistral" in model or (Context.vision_model is not None and "pixtral" in Context.vision_model and image is not None):
         full_response = generate_response_from_mistral(model, system_prompt, user_prompt, chat_history, image,
                                                       base_url=Context.endpoint, api_key=Context.api_key,
                                                       vision_model=Context.vision_model,
@@ -267,65 +273,30 @@ def shorten_text(text):
 
     return text
 
-def create_system_prompt(reusable_variables_block=None):
+def create_system_prompt(reusable_variables=None):
     """Creates a system prompt that contains instructions of general interest, available functions and variables."""
     from ._machinery import Context
 
     # determine useful variables and functions in context
-    if reusable_variables_block is None:
-        reusable_variables_block = create_reusable_variables_block()
+    if reusable_variables is None:
+        reusable_variables = create_reusable_variables_block()
     else:
         warnings.warn("Deprecated use of create_system_prompt with reusable_variables_block. Do not pass this parameter to make your code work mid/long-term.")
 
-    snippets, additional_snippets = generate_code_samples()
-    libraries = Context.libraries
+    builtin_snippets, additional_snippets = generate_code_samples()
+    libraries = ",".join([str(v) for v in Context.libraries])
 
-    system_prompt = f"""
-    You are a extremely talented bioimage analyst and you use Python to solve your tasks unless stated otherwise.
-    If there are several ways to solve the task, chose the option with the least amount of code.    
-    
-    ## Python specific instructions
-    
-    When writing python code, you can only use those libraries: {",".join([str(v) for v in libraries])}.
-    If you create images, show the results and save them in variables for later reuse.
-    {reusable_variables_block}
-    NEVER overwrite the values of the variables and functions that are available.
-    
-    ## Python specific code snippets
-    
-    If the user asks for those simple tasks, use these code snippets.
-    
-    {additional_snippets}
-    {snippets}
-    
-    ## Todos
-    
-    Answer your response in three sections:
-    1. Summary: First provide a short summary of the task.
-    2. Plan: Provide a concise step-by-step plan without any code.
-    3. Code: Provide the code.
-    
-    Structure it with markdown headings like this:
-    
-    ### Summary
-    I will do this and that.
-    
-    ### Plan
-    1. Do this.
-    2. Do that.
-    
-    ### Code
-    ```
-    this()
-    that()
-    ```
-    
-    ## Final remarks
-    
-    The following points have highest importance and may overwrite the instructions above.
-    Make sure to provide 1) summary, 2) plan and 3) code.
-    Make sure to keep your answer concise and to the point. Make sure the code you write is correct and can be executed.
-    """
+    template = Context.system_prompt_template
+
+    values = {"libraries": libraries,
+              "reusable_variables": reusable_variables,
+              "additional_snippets": additional_snippets,
+              "builtin_snippets": builtin_snippets,
+              }
+    system_prompt = template.format(**values)
+
+    if Context.verbose:
+        print("System prompt length:", len(system_prompt))
 
     return system_prompt
 
@@ -444,11 +415,19 @@ def is_image(potential_image):
 
 def correct_endpoint(endpoint, api_key):
     import os
-    from ._machinery import BLABLADOR_BASE_URL, OLLAMA_BASE_URL, AZURE_BASE_URL
-    if endpoint == 'blablador':
+    from ._machinery import BLABLADOR_BASE_URL, OLLAMA_BASE_URL, AZURE_BASE_URL, DEEPSEEK_BASE_URL, OPENROUTER_BASE_URL
+    if endpoint == "openrouter":
+        endpoint = OPENROUTER_BASE_URL
+        if api_key is None:
+            api_key = os.environ.get('OPENROUTER_API_KEY')
+    elif endpoint == 'blablador':
         endpoint = BLABLADOR_BASE_URL
         if api_key is None:
             api_key = os.environ.get('BLABLADOR_API_KEY')
+    elif endpoint == 'deepseek':
+        endpoint = DEEPSEEK_BASE_URL
+        if api_key is None:
+            api_key = os.environ.get('DEEPSEEK_API_KEY')
     elif endpoint == 'ollama':
         endpoint = OLLAMA_BASE_URL
     elif endpoint == "azure":
@@ -556,20 +535,20 @@ def refine_code(code):
     {code}
     ```
     
-    Make sure the following conditions are met:
-    * The code imports all functions and modules, that are not mentioned above.
-    * Modules which are available already, are not imported.
+    Update the code and make sure the following conditions are met:
+    * The code imports all necessary functions and modules, except available functions and modules.
     * Do not overwrite variables, if the arey in the list of defined variables.
-    * Take care that only common python libraries are imported. Do not make up modules.
-    * Avoid `import cle`. If you see something like this, `import pyclesperanto{prototype} as cle` instead.
-    * Avoid `from stackview import stackview`. If you see something like this, `import stackview` instead.
-    * Do not import modules or aliases which were already imported before.
+    * Do not make up modules when importing them.
     * Do NOT replace values such as filenames with variables.
     
     Return the code only.
     """)
 
     result = remove_outer_markdown_annotation(refined_code)
+
+    result = result.replace("import cle", f"import pyclesperanto{prototype} as cle")
+    result = result.replace("from stackview import stackview", "import stackview")
+
     if result is None:
         return original_code
     return result

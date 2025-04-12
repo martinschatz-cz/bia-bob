@@ -15,15 +15,6 @@ Using it with Ollama is free but requires running an Ollama server locally.
 
 ![img.png](https://github.com/haesleinhuepf/bia-bob/raw/main/docs/images/banner.png)
 
-## Disclaimer
-
-`bia-bob` is a research project aiming at streamlining the design of image analysis workflows. Under the hood it uses
-artificial intelligence / large language models to generate text and code fulfilling the user's requests. 
-Users are responsible to verify the generated code according to good scientific practice. Some general advice:
-* If you do not understand what a generated code snippet does, ask `%%bob explain this code in detail to a Python beginner:` before executing the code.
-* After Bob generated a data analysis workflow for you, ask `%%bob How could I verify this analysis workflow ?`. It is good scientific practice to measure the quality of segmentation results for example, or to measure the difference of automated quantitative measurements, in comparison to manual analysis.
-* If you are not sure if an image analysis workflow is valid, consider asking human experts. E.g. reach out via https://image.sc .
-
 > [!CAUTION]
 > When using the OpenAI, Google Gemini, Anthropic, Github Models or any other endpoint via BiA-Bob, you are bound to the terms of service 
 > of the respective companies or organizations.
@@ -126,6 +117,33 @@ This can also be used to create other files, e.g. CSV files.
 ![img.png](https://github.com/haesleinhuepf/bia-bob/raw/main/docs/images/cli_csv_files.png)
 
 
+## Disclaimer
+
+`bia-bob` is a research project aiming at streamlining the design of image analysis workflows. Under the hood it uses
+artificial intelligence / large language models to generate text and code fulfilling the user's requests. 
+Users are responsible to verify the generated code according to good scientific practice. Some general advice:
+* If you do not understand what a generated code snippet does, ask `%%bob explain this code in detail to a Python beginner:` before executing the code.
+* After Bob generated a data analysis workflow for you, ask `%%bob How could I verify this analysis workflow ?`. It is good scientific practice to measure the quality of segmentation results for example, or to measure the difference of automated quantitative measurements, in comparison to manual analysis.
+* If you are not sure if an image analysis workflow is valid, consider asking human experts. E.g. reach out via https://image.sc .
+
+
+### What bia-bob submits to the LLM service providers
+
+When sending a request to the LLM service providers, `bia-bob` sends the following information:
+* The content of the cell you were typing
+* If you entered variables using the `{variable}` syntax, the content of these variables
+* All available variable, function and module names in the current Python environment (not variable values)
+* A selected list of Python libraries that are installed
+* The conversation history of the current session
+* Optional: The image mentioned in the first line of the cell
+
+This information is necessary to enable bia-bob to generate code that runs in your environment. 
+If you want to know exactly what is sent to the server, you can activate verbose mode like this:
+```
+from bia_bob._machinery import Context
+Context.verbose = True
+```
+
 ## Known issues
 
 If you want to ask `bob` a question, you need to put a space before the `?`.
@@ -155,6 +173,19 @@ OR install bob into an existing environment:
 ```
 pip install bia-bob
 ```
+
+## Add to startup code (optional)
+
+If you would like to use the `%bob` magic in notebooks without need for importing `bia_bob` first, 
+you can add a `bia_bob.ipy` file to your Jupyter startup directory `~/.ipython/profile_default/startup/` with this content:
+
+```
+from bia_bob import bob
+``` 
+
+![img.png](docs/images/startup_bob.png)
+
+Note: This might require to install bia_bob in the base environment.
 
 ## Setting API keys
 
@@ -220,6 +251,14 @@ bob.initialize(
     model='Phi-3.5-mini-instruct')
 ```
 
+### Using OpenRouter
+
+If you are using models via [OpenRouter](https://openrouter.ai/), store your API key for accessing the models in an environment variable named `OPENROUTER_API_KEY`. You can then access the models like this:
+
+```
+bob.initialize(model="anthropic/claude-3.7-sonnet", endpoint="openrouter")
+```
+
 ### Using Azure
 
 If you are using the models hosted on [Microsoft Azure](https://azure.microsoft.com/), please store your API key for accessing the models in an environment variable named `AZURE_API_KEY`.
@@ -241,7 +280,7 @@ bob.initialize(
 
 ### Using custom endpoints
 
-Custom endpoints can be used as well if they support the OpenAI API. Examples are [blablador](https://login.helmholtz.de/oauth2-as/oauth2-authz-web-entry) and [ollama](https://ollama.com/).
+Custom endpoints can be used as well if they support the OpenAI API. Examples are [DeepSeek](https://www.deepseek.com/), [KISSKI](https://kisski.gwdg.de/leistungen/2-02-llm-service/), [blablador](https://login.helmholtz.de/oauth2-as/oauth2-authz-web-entry) and [ollama](https://ollama.com/).
 An example is shown in [this notebook](https://github.com/haesleinhuepf/bia-bob/blob/main/demo/custom_endpoints.ipynb):
 
 For this, just install the openai backend as explained above (tested version: 1.5.0).
@@ -249,6 +288,11 @@ For this, just install the openai backend as explained above (tested version: 1.
 ```
 bob.initialize(endpoint='ollama', model='codellama')
 ```
+* For using DeepSeek, you need to get an [API key](https://platform.deepseek.com/api_keys). Store it in your environment as `DEEPSEEK_API_KEY` variable.
+```
+bob.initialize(endpoint='deepseek', model='deepseek-chat')
+```
+
 * If you want to use blablador, which is free for German academics, just get an API key as explained on
 [this page](https://sdlaml.pages.jsc.fz-juelich.de/ai/guides/blablador_api_access/) and store it in your environment as `BLABLADOR_API_KEY` variable.
 ```
@@ -297,6 +341,28 @@ gcloud auth application-default login
 Follow the instructions in the browser. Enter your Project ID (not the name). If it worked the terminal should approximately look like this:
 
 ![img.png](https://github.com/haesleinhuepf/bia-bob/raw/main/docs/images/gcloud_auth.png)
+
+## Configuration
+
+You can also configure the system message `bia-bob` is using, which might be useful in particular when using it with
+small open-weight language models executed on local hardware, or when using it in scenarios that are not bio-image 
+analysis related.
+
+```
+from bia_bob import bob
+bob.initialize(system_prompt="""
+    You are an excellent astronomer and Python programmer.
+    You typically use Python libraris from this domain.
+""")
+```
+
+In this system message you can use place-holders which are set when bob is invoked:
+* `{libraries}`: A list of Python libraries that are installed an bio-image analysis related (scikit-image, stackview, ...)
+* `{reusable_variables}`: A list of variables that are available in the current Python environment
+* `{builtin_snippets}`: A list of built-in code snippets that might be helpful for bio-image analysis
+* `{additional_snippets}`: A list of additional code snippets that is assembled from Python libraries that support giving hints to bob.
+
+More examples are available in the [demo notebook](https://github.com/haesleinhuepf/bia-bob/raw/main/demo/system_messages.ipynb).
 
 ## Development
 
@@ -348,6 +414,7 @@ List of known Python libraries that provide extensions to Bob:
 
 There are similar projects:
 * [jupyter-ai](https://github.com/jupyterlab/jupyter-ai)
+* [JupyterLab Magic Wand](https://github.com/Zsailer/jupyterlab-magic-wand)
 * [chatGPT-jupyter-extension](https://github.com/jflam/chat-gpt-jupyter-extension)
 * [chapyter](https://github.com/chapyter/chapyter/)
 * [napari-chatGPT](https://github.com/royerlab/napari-chatgpt)
